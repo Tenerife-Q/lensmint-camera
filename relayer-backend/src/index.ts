@@ -4,12 +4,18 @@ import dotenv from 'dotenv';
 import nacl from 'tweetnacl';
 import { ethers } from 'ethers';
 import { 
-    Keypair, TransactionInstruction, PublicKey, 
-    TransactionMessage, VersionedTransaction 
+    Keypair, TransactionInstruction, PublicKey,
+    TransactionMessage, VersionedTransaction,
+    SystemProgram 
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import dns from 'dns';
 import axios from 'axios';
+import crypto from 'crypto';
+
+const LENS_MINT_ABI = [
+    "function mintFromHardware(address to, string calldata uuid, bytes32 sha256Hash, string calldata pHash) external returns (uint256)"
+];
 
 dns.setDefaultResultOrder('ipv4first');
 dotenv.config();
@@ -41,12 +47,10 @@ const evmProvider = evmRpc ? new ethers.JsonRpcProvider(evmRpc) : null;
 const evmWallet = (evmKey && evmProvider) ? new ethers.Wallet(evmKey, evmProvider) : null;
 const solanaKeypair = solKey ? Keypair.fromSecretKey(bs58.decode(solKey)) : null;
 
-const SOLANA_MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
-
 const HTTP_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0'
 };
 
 app.post('/api/v1/mint', async (req: Request, res: Response) => {
@@ -76,35 +80,86 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
                 return res.status(401).json({ error: 'Signature verification failed' });
             }
         } catch (e: any) {
-            return res.status(401).json({ error: 'Invalid cryptographic material format' });
+            return res.status(401).json({ error: 'Invalid crypto format' });
         }
 
         console.log(`\n[Relayer] Auth OK | UUID: ${uuid} | Target: ${chain.toUpperCase()}`);
 
-        const metadataStr = `LensMint|${uuid}|${sha256}|${phash}`;
         let txHash = '';
 
         if (chain.toLowerCase() === 'evm') {
-            if (!evmWallet) {
-                return res.status(500).json({ error: 'EVM wallet not configured' });
+            const evmContractAddress = process.env.EVM_CONTRACT_ADDRESS ? process.env.EVM_CONTRACT_ADDRESS.trim() : '';
+            if (!evmWallet || !evmContractAddress) {
+                return res.status(500).json({ error: 'EVM config missing' });
             }
             
-            const txData = ethers.hexlify(ethers.toUtf8Bytes(metadataStr));
-            const tx = await evmWallet.sendTransaction({ to: evmWallet.address, value: 0, data: txData });
-            txHash = tx.hash;
-
-        } else if (chain.toLowerCase() === 'solana') {
-            if (!solanaKeypair) {
-                return res.status(500).json({ error: 'Solana keypair not configured' });
+            const lensContract = new ethers.Contract(evmContractAddress, LENS_MINT_ABI, evmWallet);
+            const sha256Bytes32 = "0x" + sha256; 
+            
+            try {
+                console.log(`[Relayer] Executing EVM Contract Mint...`);
+                const tx = await lensContract.mintFromHardware(
+                    evmWallet.address,
+                    uuid,
+                    sha256Bytes32,
+                    phash
+                );
+                txHash = tx.hash;
+            } catch (e: any) {
+                console.error(`[Relayer] EVM Error:`, e.message);
+                return res.status(502).json({ error: `EVM mint failed: ${e.message}` });
             }
 
+        } else if (chain.toLowerCase() === 'solana') {
+            const solanaProgramIdStr = process.env.SOLANA_PROGRAM_ID ? process.env.SOLANA_PROGRAM_ID.trim() : '';
+            if (!solanaKeypair || !solanaProgramIdStr) {
+                return res.status(500).json({ error: 'Solana config missing' });
+            }
+
+            const programId = new PublicKey(solanaProgramIdStr);
+            const sha256Buffer = Buffer.from(sha256, 'hex');
+
+            if (sha256Buffer.length !== 32) {
+                return res.status(400).json({ error: 'Invalid sha256 length' });
+            }
+
+            // PDA Derivation
+            const [cameraRecordPDA] = PublicKey.findProgramAddressSync(
+                [Buffer.from("camera"), sha256Buffer],
+                programId
+            );
+
+            // Anchor Discriminator
+            const sighash = crypto.createHash('sha256').update('global:mint_from_hardware').digest().subarray(0, 8);
+
+            // Borsh Serialization
+            const uuidBuffer = Buffer.from(uuid, 'utf8');
+            const uuidLen = Buffer.alloc(4);
+            uuidLen.writeUInt32LE(uuidBuffer.length);
+
+            const phashBuffer = Buffer.from(phash, 'utf8');
+            const phashLen = Buffer.alloc(4);
+            phashLen.writeUInt32LE(phashBuffer.length);
+
+            const dataBuffer = Buffer.concat([
+                sighash,
+                uuidLen, uuidBuffer,
+                sha256Buffer, // Fixed 32 bytes array, no length prefix
+                phashLen, phashBuffer
+            ]);
+
             const ix = new TransactionInstruction({
-                keys: [{ pubkey: solanaKeypair.publicKey, isSigner: true, isWritable: true }],
-                programId: SOLANA_MEMO_PROGRAM_ID,
-                data: Buffer.from(metadataStr, 'utf8'),
+                programId: programId,
+                keys: [
+                    { pubkey: cameraRecordPDA, isSigner: false, isWritable: true },
+                    { pubkey: solanaKeypair.publicKey, isSigner: true, isWritable: true },
+                    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+                ],
+                data: dataBuffer,
             });
 
-            console.log(`[Relayer] Fetching Blockhash (Multi-RPC Failover)...`);
+            console.log(`[Relayer] Anchor PDA: ${cameraRecordPDA.toBase58()}`);
+            console.log(`[Relayer] Fetching Blockhash...`);
             
             const rpcNodes = [
                 solRpc,
@@ -119,12 +174,10 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
             for (const rpc of rpcNodes) {
                 try {
                     const cleanRpc = rpc.replace(/^SOLANA_RPC_URL=/, '').trim();
-                    console.log(`[Relayer] Attempting RPC: ${cleanRpc}`);
-                    
                     const { data } = await axios.post(cleanRpc, {
                         jsonrpc: '2.0', id: 1, 
                         method: 'getLatestBlockhash', 
-                        params: [{ commitment: 'confirmed' }]
+                        params: [{ commitment: 'finalized' }]
                     }, { headers: HTTP_HEADERS, timeout: 5000 });
 
                     const parsedData = Array.isArray(data) ? data[0] : data;
@@ -132,18 +185,15 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
                     if (parsedData?.result?.value?.blockhash) {
                         recentBlockhash = parsedData.result.value.blockhash;
                         successfulRpc = cleanRpc;
-                        console.log(`[Relayer] Blockhash acquired: ${recentBlockhash.substring(0, 10)}...`);
                         break;
-                    } else {
-                        console.log(`[Relayer] Invalid RPC response format (potential WAF block). Failing over...`);
                     }
                 } catch (e: any) {
-                    console.log(`[Relayer] RPC connection failed or timed out. Failing over...`);
+                    continue;
                 }
             }
 
             if (!recentBlockhash) {
-                return res.status(502).json({ error: 'All Solana RPC nodes failed to respond' });
+                return res.status(502).json({ error: 'RPC nodes failed' });
             }
 
             const messageV0 = new TransactionMessage({
@@ -155,7 +205,7 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
             const transaction = new VersionedTransaction(messageV0);
             transaction.sign([solanaKeypair]);
             
-            console.log(`[Relayer] Broadcasting transaction via [${successfulRpc}]...`);
+            console.log(`[Relayer] Broadcasting via [${successfulRpc}]...`);
 
             const serializedTx = Buffer.from(transaction.serialize()).toString('base64');
             try {
@@ -167,15 +217,15 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
                         skipPreflight: true, 
                         maxRetries: 3 
                     }]
-                }, { headers: HTTP_HEADERS, timeout: 10000 });
+                }, { headers: HTTP_HEADERS, timeout: 15000 });
 
                 const parsedSend = Array.isArray(sendData) ? sendData[0] : sendData;
                 
                 if (parsedSend.error) throw new Error(parsedSend.error.message);
                 txHash = parsedSend.result;
             } catch (e: any) {
-                console.error(`[Relayer] SendTx Error:`, e.message);
-                return res.status(502).json({ error: `SendTx error: ${e.message}` });
+                console.error(`[Relayer] Solana Tx Error:`, e.message);
+                return res.status(502).json({ error: `Solana send tx error: ${e.message}` });
             }
             
         } else {
@@ -186,8 +236,8 @@ app.post('/api/v1/mint', async (req: Request, res: Response) => {
         return res.json({ tx_hash: txHash });
 
     } catch (error: any) {
-        console.error('[Relayer] Transaction failed:', error.message);
-        return res.status(500).json({ error: 'Internal server error', details: error.message });
+        console.error('[Relayer] Server error:', error.message);
+        return res.status(500).json({ error: 'Server error', details: error.message });
     }
 });
 
