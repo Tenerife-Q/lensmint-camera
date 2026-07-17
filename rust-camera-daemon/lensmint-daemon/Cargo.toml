@@ -21,5 +21,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-reqwest-middleware = "0.3"
-reqwest-retry = "0.5"
+alloy = { version = "2.1.1", features = ["provider-http", "signer-local", "contract", "rpc-types-eth", "network", "reqwest-rustls-tls"] }
+solana-sdk = "2.2"
+bs58 = "0.5.1"
+bincode = "1"
+base64 = "0.22"
+# Needed for aarch64 cross-compile (solana-sdk → openssl-sys).
+openssl = { version = "0.10", features = ["vendored"] }
