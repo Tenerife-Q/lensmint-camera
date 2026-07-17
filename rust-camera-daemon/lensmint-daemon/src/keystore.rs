@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 pub struct LocalKeystore {
     pub signing_key: SigningKey,
@@ -28,31 +28,35 @@ impl LocalKeystore {
 
         let key_path = config_dir.join("keystore.pem");
 
-        if key_path.exists() {
+        let signing_key = if key_path.exists() {
             let pem_str = fs::read_to_string(&key_path)?;
-            let signing_key = SigningKey::from_pkcs8_pem(&pem_str)?;
-            Ok(Self { signing_key })
+            SigningKey::from_pkcs8_pem(&pem_str)?
         } else {
             let mut csprng = OsRng;
-            let signing_key = SigningKey::generate(&mut csprng);
-            let pem_str = signing_key.to_pkcs8_pem(Default::default())?;
+            let key = SigningKey::generate(&mut csprng);
+            let pem_str = key.to_pkcs8_pem(Default::default())?;
 
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&key_path)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
 
             #[cfg(unix)]
             {
-                let mut perms = file.metadata()?.permissions();
-                perms.set_mode(0o400); 
-                file.set_permissions(perms)?;
+                options.mode(0o400);
             }
 
+            let mut file = options.open(&key_path)?;
             file.write_all(pem_str.as_bytes())?;
+            key
+        };
 
-            Ok(Self { signing_key })
-        }
+        let keystore = Self { signing_key };
+        
+        println!("==================================================");
+        println!("[LensMint] Camera Ed25519 Pubkey for EVM Contract:");
+        println!("0x{}", keystore.public_key_hex());
+        println!("==================================================");
+
+        Ok(keystore)
     }
 
     /// Signs raw off-chain payload data using the local identity key.

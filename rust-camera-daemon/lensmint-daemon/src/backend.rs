@@ -3,15 +3,13 @@ use std::os::unix::io::RawFd;
 use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use eframe::egui;
-use crate::cmd::{DaemonCmd, AppEvent, ChainTarget};
+use crate::cmd::{DaemonCmd, AppEvent, CameraSettings};
 use std::sync::atomic::{AtomicI32, Ordering};
 use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::chain::{MintLifecycle, MintRequest};
+use crate::queue::{MintOutcome, MintQueue};
 
-use reqwest_middleware::ClientBuilder;
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-
+// V4L2 FFI definitions
 #[repr(C)]
 pub struct v4l2_pix_format {
     pub width: u32,
@@ -255,7 +253,7 @@ async fn process_and_store_image(
         db.insert(uuid.as_bytes(), cursor.into_inner())?;
         db.flush()?;
 
-        println!("[Storage] Dual-track save complete: {}", uuid);
+        println!("[Storage] Save complete: {}", uuid);
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }).await??;
 
@@ -295,27 +293,6 @@ pub async fn compute_image_hashes(
     .await?
 }
 
-#[derive(Serialize)]
-pub struct MetadataPayload {
-    pub uuid: String,
-    pub sha256: String,
-    pub phash: String,
-    pub pubkey: String,
-    pub timestamp: u64,
-    pub chain: String,
-}
-
-#[derive(Serialize)]
-pub struct SignedEnvelope {
-    pub payload_json: String,
-    pub signature: String,
-}
-
-#[derive(Deserialize)]
-pub struct RelayerResponse {
-    pub tx_hash: String,
-}
-
 pub async fn run_backend(
     mut rx: mpsc::Receiver<DaemonCmd>, 
     shared_frame: Arc<Mutex<Vec<u8>>>,
@@ -333,15 +310,7 @@ pub async fn run_backend(
         }
     }
 
-    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-    let base_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("Failed to build reqwest client");
-
-    let http_client = ClientBuilder::new(base_client)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build();
+    let mint_queue = MintQueue::new();
 
     let mut local_rgba = vec![255u8; 640 * 480 * 4];
     let mut pending_capture: Option<uuid::Uuid> = None;
@@ -350,12 +319,22 @@ pub async fn run_backend(
     let mut child_process: Option<tokio::process::Child> = None;
     let mut current_video_uuid: Option<uuid::Uuid> = None;
 
+    let mut current_settings = CameraSettings::default();
+
     loop {
         if let Ok(cmd) = rx.try_recv() {
             match cmd {
+                DaemonCmd::UpdateSettings(new_settings) => {
+                    println!(
+                        "[Worker] Settings applied: chain={:?} evm_chain_id={} solana_cluster={}",
+                        new_settings.active_chain,
+                        new_settings.evm_chain_id,
+                        new_settings.solana_cluster
+                    );
+                    current_settings = new_settings;
+                },
                 DaemonCmd::CapturePhoto(uuid) => {
                     pending_capture = Some(uuid);
-                    println!("[Worker] Capture triggered: {}", uuid);
                 },
                 DaemonCmd::SetFocus(val) => {
                     if let Some(cam) = &camera {
@@ -380,81 +359,89 @@ pub async fn run_backend(
                         });
 
                         if let Ok(Err(e)) = db_del.await {
-                            eprintln!("[Storage] DB delete error for {}: {}", uuid, e);
-                        } else {
-                            println!("[Storage] Cascade deletion complete: {}", uuid);
+                            eprintln!("[Storage] DB delete error: {}", e);
                         }
                     });
                 },
                 DaemonCmd::Mint(uuid, target) => {
                     let db_clone = db.clone();
                     let key_clone = keystore.clone();
-                    let client_clone = http_client.clone();
                     let tx_clone = event_tx.clone();
                     let ui_ctx = ctx.clone();
-                    
+                    let queue = mint_queue.clone();
+                    let evm_chain_id = current_settings.evm_chain_id;
+                    let solana_cluster = current_settings.solana_cluster.clone();
+
                     tokio::spawn(async move {
-                        match compute_image_hashes(db_clone, uuid).await {
-                            Ok(hashes) => {
-                                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                                let chain_str = match target {
-                                    ChainTarget::EVM => "evm".to_string(),
-                                    ChainTarget::Solana => "solana".to_string(),
-                                };
-                                
-                                let payload = MetadataPayload {
-                                    uuid: uuid.to_string(),
-                                    sha256: hashes.sha256,
-                                    phash: hashes.phash,
-                                    pubkey: key_clone.public_key_hex(),
-                                    timestamp: ts,
-                                    chain: chain_str, 
-                                };
+                        let _ = tx_clone.send(AppEvent::MintProgress(uuid, "QUEUED".to_string()));
+                        ui_ctx.request_repaint();
 
-                                if let Ok(json_str) = serde_json::to_string(&payload) {
-                                    let sig = key_clone.sign_payload_hex(json_str.as_bytes());
-                                    let envelope = SignedEnvelope {
-                                        payload_json: json_str,
-                                        signature: sig,
-                                    };
-                                    
-                                    let relayer_url = std::env::var("RELAYER_URL")
-                                        .unwrap_or_else(|_| "http://relayer.lensmint.local/api/v1/mint".to_string());
-
-                                    let envelope_body = serde_json::to_string(&envelope).unwrap_or_default();
-                                    
-                                    let res = client_clone.post(&relayer_url)
-                                        .header("Content-Type", "application/json")
-                                        .body(envelope_body)
-                                        .send()
-                                        .await;
-                                    
-                                    match res {
-                                        Ok(response) if response.status().is_success() => {
-                                            match response.json::<RelayerResponse>().await {
-                                                Ok(data) => {
-                                                    println!("[Web3] Mint success for {}, tx_hash: {}", uuid, data.tx_hash);
-                                                    let _ = tx_clone.send(AppEvent::MintSuccess(uuid, target, data.tx_hash));
-                                                },
-                                                Err(e) => {
-                                                    let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, format!("Response parse error: {}", e)));
-                                                }
-                                            }
-                                        },
-                                        Ok(bad_resp) => {
-                                            let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, bad_resp.status().to_string()));
-                                        },
-                                        Err(e) => {
-                                            let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e.to_string()));
-                                        }
-                                    }
-                                }
-                            },
+                        let hashes = match compute_image_hashes(db_clone, uuid).await {
+                            Ok(h) => h,
                             Err(e) => {
                                 let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e.to_string()));
+                                ui_ctx.request_repaint();
+                                return;
+                            }
+                        };
+
+                        // Idempotent short-circuit for a capture that already minted.
+                        if let Some(MintOutcome::Completed { tx_hash }) =
+                            queue.peek(&target, &hashes.sha256).await
+                        {
+                            println!("[Mint] Duplicate capture, prior tx={tx_hash}");
+                            let _ = tx_clone.send(AppEvent::MintSuccess(uuid, target, tx_hash));
+                            ui_ctx.request_repaint();
+                            return;
+                        }
+
+                        let device_id = key_clone.public_key_hex();
+                        let signed_message =
+                            format!("{}|{}|{}", uuid, hashes.sha256, hashes.phash);
+                        let _signature = key_clone.sign_payload_hex(signed_message.as_bytes());
+
+                        let req = MintRequest {
+                            uuid: uuid.to_string(),
+                            sha256: hashes.sha256,
+                            phash: hashes.phash,
+                            device_id,
+                            target_address: None,
+                        };
+
+                        let tx_progress = tx_clone.clone();
+                        let ui_progress = ui_ctx.clone();
+                        let result = queue
+                            .mint(target.clone(), evm_chain_id, solana_cluster, req, |life, hash| {
+                                let label = match life {
+                                    MintLifecycle::Broadcasted => "WAITING BLOCK",
+                                    MintLifecycle::Bumping => "BUMPING GAS",
+                                    MintLifecycle::Mined => "ON-CHAIN",
+                                    MintLifecycle::Failed => "FAILED",
+                                };
+                                if let Some(h) = hash {
+                                    println!("[Mint] {} tx={}", life.as_str(), h);
+                                } else {
+                                    println!("[Mint] {}", life.as_str());
+                                }
+                                let _ = tx_progress
+                                    .send(AppEvent::MintProgress(uuid, label.to_string()));
+                                ui_progress.request_repaint();
+                            })
+                            .await;
+
+                        match result {
+                            Ok(r) => {
+                                let _ = tx_clone.send(AppEvent::MintSuccess(
+                                    uuid,
+                                    target,
+                                    r.tx_hash,
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e));
                             }
                         }
-                        ui_ctx.request_repaint(); 
+                        ui_ctx.request_repaint();
                     });
                 },
                 DaemonCmd::StartVideo(uuid) => {
@@ -490,7 +477,7 @@ pub async fn run_backend(
                                 if stdin.write_all(&frame).await.is_err() { break; }
                             }
                         });
-                        println!("[Hardware] Started video recording: {}", uuid);
+                        println!("[Hardware] Recording video: {}", uuid);
                     }
                 },
                 DaemonCmd::StopVideo => {
@@ -501,7 +488,6 @@ pub async fn run_backend(
                             let db_clone = db.clone();
                             tokio::spawn(async move {
                                 let _ = child.wait().await;
-                                println!("[Hardware] Video recording finalized: {}", uuid);
                                 let video_path = dir_clone.join(format!("{}.mp4", uuid));
                                 let thumb_output = tokio::process::Command::new("ffmpeg")
                                     .args(&[
@@ -549,9 +535,7 @@ pub async fn run_backend(
                     let dir_clone = photos_dir.clone();
                     
                     tokio::spawn(async move {
-                        if let Err(e) = process_and_store_image(uuid, frame_clone, db_clone.clone(), dir_clone).await {
-                            eprintln!("[Storage] Pipeline failed for {}: {}", uuid, e);
-                        }
+                        let _ = process_and_store_image(uuid, frame_clone, db_clone.clone(), dir_clone).await;
                     });
                 }
 
