@@ -4,6 +4,7 @@ mod backend;
 mod cmd;
 mod config;
 mod chain;
+mod hash_record;
 mod queue;
 
 use app::LensMintApp;

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use crate::cmd::{DaemonCmd, AppEvent, CameraSettings};
 use std::sync::atomic::{AtomicI32, Ordering};
-use sha2::{Sha256, Digest};
 use crate::chain::{MintLifecycle, MintRequest};
+use crate::hash_record::HashRecord;
 use crate::queue::{MintOutcome, MintQueue};
 
 // V4L2 FFI definitions
@@ -228,34 +228,49 @@ pub fn yuyv_to_rgba_in_place(yuyv: &[u8], rgba: &mut [u8], width: usize, height:
 }
 
 async fn process_and_store_image(
-    uuid: uuid::Uuid, 
-    rgba_data: Vec<u8>, 
-    db: Arc<sled::Db>, 
-    photos_dir: std::path::PathBuf
+    uuid: uuid::Uuid,
+    rgba_data: Vec<u8>,
+    db: Arc<sled::Db>,
+    photos_dir: std::path::PathBuf,
+    keystore: Arc<crate::keystore::LocalKeystore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || {
         let img = image::RgbaImage::from_raw(640, 480, rgba_data)
             .ok_or("Failed to construct RgbaImage")?;
 
+        // One encode: disk JPEG bytes == hashed bytes.
+        let mut jpeg_bytes = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
+            img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+        }
         let file_path = photos_dir.join(format!("{}.jpg", uuid));
-        img.save_with_format(&file_path, image::ImageFormat::Jpeg)?;
+        std::fs::write(&file_path, &jpeg_bytes)?;
+
+        let record = HashRecord::create_from_jpeg_bytes(uuid, &jpeg_bytes, &keystore)?;
+        record.save(&photos_dir)?;
+        record.verify_signature()?;
 
         let thumbnail = image::imageops::resize(
-            &img, 
-            256, 
-            192, 
-            image::imageops::FilterType::Triangle 
+            &img,
+            256,
+            192,
+            image::imageops::FilterType::Triangle,
         );
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         thumbnail.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
-        
+
         db.insert(uuid.as_bytes(), cursor.into_inner())?;
         db.flush()?;
 
-        println!("[Storage] Save complete: {}", uuid);
+        println!(
+            "[Storage] Save complete: {} (hash record alg={})",
+            uuid, record.alg
+        );
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-    }).await??;
+    })
+    .await??;
 
     Ok(())
 }
@@ -265,30 +280,29 @@ pub struct ImageHashes {
     pub phash: String,
 }
 
-pub async fn compute_image_hashes(
-    db: Arc<sled::Db>,
+// Prefer HashRecord; else hash on-disk JPEG (legacy photos without sidecar).
+pub async fn resolve_image_hashes(
+    photos_dir: std::path::PathBuf,
     uuid: uuid::Uuid,
 ) -> Result<ImageHashes, Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || {
-        let img_bytes = db.get(uuid.as_bytes())?
-            .ok_or("missing image in sled cache")?;
+        if let Ok(record) = HashRecord::load(&photos_dir, &uuid) {
+            record.verify_signature()?;
+            return Ok(ImageHashes {
+                sha256: record.sha256,
+                phash: record.phash,
+            });
+        }
 
-        let mut sha256_hasher = Sha256::new();
-        sha256_hasher.update(&img_bytes);
-        let sha256_hex = hex::encode(sha256_hasher.finalize());
-
-        let img = image::load_from_memory(&img_bytes)?;
-        let p_hasher = image_hasher::HasherConfig::new()
-            .hash_alg(image_hasher::HashAlg::Gradient)
-            .to_hasher();
-            
-        let phash = p_hasher.hash_image(&img);
-        let phash_hex = hex::encode(phash.as_bytes());
-
-        Ok(ImageHashes {
-            sha256: sha256_hex,
-            phash: phash_hex,
-        })
+        let jpeg_path = photos_dir.join(format!("{uuid}.jpg"));
+        let jpeg_bytes = std::fs::read(&jpeg_path).map_err(|e| {
+            format!(
+                "no hash record and missing JPEG at {}: {e}",
+                jpeg_path.display()
+            )
+        })?;
+        let (sha256, phash) = crate::hash_record::compute_hashes_from_jpeg(&jpeg_bytes)?;
+        Ok(ImageHashes { sha256, phash })
     })
     .await?
 }
@@ -347,11 +361,13 @@ pub async fn run_backend(
                     let db_clone = db.clone();
                     let file_path_jpg = photos_dir.join(format!("{}.jpg", uuid));
                     let file_path_mp4 = photos_dir.join(format!("{}.mp4", uuid));
-                    
+                    let file_path_hash = HashRecord::path_for(&photos_dir, &uuid);
+
                     tokio::spawn(async move {
                         let _ = tokio::fs::remove_file(&file_path_jpg).await;
                         let _ = tokio::fs::remove_file(&file_path_mp4).await;
-                        
+                        let _ = tokio::fs::remove_file(&file_path_hash).await;
+
                         let db_del = tokio::task::spawn_blocking(move || {
                             let res = db_clone.remove(uuid.as_bytes());
                             let _ = db_clone.flush();
@@ -364,19 +380,19 @@ pub async fn run_backend(
                     });
                 },
                 DaemonCmd::Mint(uuid, target) => {
-                    let db_clone = db.clone();
                     let key_clone = keystore.clone();
                     let tx_clone = event_tx.clone();
                     let ui_ctx = ctx.clone();
                     let queue = mint_queue.clone();
                     let evm_chain_id = current_settings.evm_chain_id;
                     let solana_cluster = current_settings.solana_cluster.clone();
+                    let photos_dir_clone = photos_dir.clone();
 
                     tokio::spawn(async move {
                         let _ = tx_clone.send(AppEvent::MintProgress(uuid, "QUEUED".to_string()));
                         ui_ctx.request_repaint();
 
-                        let hashes = match compute_image_hashes(db_clone, uuid).await {
+                        let hashes = match resolve_image_hashes(photos_dir_clone, uuid).await {
                             Ok(h) => h,
                             Err(e) => {
                                 let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e.to_string()));
@@ -396,9 +412,6 @@ pub async fn run_backend(
                         }
 
                         let device_id = key_clone.public_key_hex();
-                        let signed_message =
-                            format!("{}|{}|{}", uuid, hashes.sha256, hashes.phash);
-                        let _signature = key_clone.sign_payload_hex(signed_message.as_bytes());
 
                         let req = MintRequest {
                             uuid: uuid.to_string(),
@@ -533,9 +546,15 @@ pub async fn run_backend(
                     let frame_clone = local_rgba.clone();
                     let db_clone = db.clone();
                     let dir_clone = photos_dir.clone();
-                    
+                    let key_clone = keystore.clone();
+
                     tokio::spawn(async move {
-                        let _ = process_and_store_image(uuid, frame_clone, db_clone.clone(), dir_clone).await;
+                        if let Err(e) =
+                            process_and_store_image(uuid, frame_clone, db_clone, dir_clone, key_clone)
+                                .await
+                        {
+                            eprintln!("[Storage] Capture failed for {uuid}: {e}");
+                        }
                     });
                 }
 
