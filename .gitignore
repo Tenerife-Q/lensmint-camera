@@ -146,6 +146,11 @@ docs/ TechnologyReflection.md
 docs/GSoC2026TenerifeLensMintProposal.pdf
 docs/issue-18-architecture-learn.md
 docs/pr-body-issue-18.md
+docs/issue-19-body.md
+docs/issue-19-architecture-learn.md
+docs/pr-body-issue-19.md
+docs/mentor-call-2026-07-25.md
+docs/mentor-call-2026-07-25-decision.md
 
 # Local leftovers — do not push
 solana-contracts/programs/solana-contracts/tests_bak/
