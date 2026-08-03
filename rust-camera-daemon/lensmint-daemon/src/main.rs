@@ -5,6 +5,7 @@ mod cmd;
 mod config;
 mod chain;
 mod hash_record;
+mod proof_gate;
 mod queue;
 
 use app::LensMintApp;

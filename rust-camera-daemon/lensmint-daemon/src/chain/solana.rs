@@ -117,6 +117,9 @@ pub async fn mint(
     let cfg = contracts
         .solana(cluster)
         .ok_or_else(|| format!("no Solana program configured for cluster '{cluster}'"))?;
+    if req.proof.is_none() {
+        return Err("Solana mint requires proof attachment from mint gate".into());
+    }
     let program_id = Pubkey::from_str(&cfg.program_id)
         .map_err(|e| format!("invalid program_id: {e}"))?;
     let mpl_core = Pubkey::from_str(&cfg.mpl_core).map_err(|e| format!("invalid mpl_core: {e}"))?;

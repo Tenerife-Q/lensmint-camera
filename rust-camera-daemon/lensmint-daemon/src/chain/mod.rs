@@ -28,6 +28,15 @@ impl MintLifecycle {
 }
 
 #[derive(Debug, Clone)]
+pub struct MintProofAttach {
+    pub receipt_sha256: String,
+    pub distance: u32,
+    pub phash1: String,
+    pub receipt_file: String,
+    pub journal_file: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct MintRequest {
     pub uuid: String,
     pub sha256: String,
@@ -35,6 +44,7 @@ pub struct MintRequest {
     pub device_id: String,
     /// NFT recipient; `None` / zero address mints to the gas wallet.
     pub target_address: Option<String>,
+    pub proof: Option<MintProofAttach>,
 }
 
 #[derive(Debug, Clone)]

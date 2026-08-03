@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use crate::cmd::{DaemonCmd, AppEvent, CameraSettings};
 use std::sync::atomic::{AtomicI32, Ordering};
-use crate::chain::{MintLifecycle, MintRequest};
+use crate::chain::{MintLifecycle, MintProofAttach, MintRequest};
 use crate::hash_record::HashRecord;
+use crate::proof_gate::{self, require_proof_for_mint, save_mint_proof};
 use crate::queue::{MintOutcome, MintQueue};
 
 // V4L2 FFI definitions
@@ -362,11 +363,17 @@ pub async fn run_backend(
                     let file_path_jpg = photos_dir.join(format!("{}.jpg", uuid));
                     let file_path_mp4 = photos_dir.join(format!("{}.mp4", uuid));
                     let file_path_hash = HashRecord::path_for(&photos_dir, &uuid);
+                    let file_path_receipt = proof_gate::receipt_path(&photos_dir, &uuid);
+                    let file_path_journal = proof_gate::journal_path(&photos_dir, &uuid);
+                    let file_path_mint_proof = proof_gate::mint_proof_path(&photos_dir, &uuid);
 
                     tokio::spawn(async move {
                         let _ = tokio::fs::remove_file(&file_path_jpg).await;
                         let _ = tokio::fs::remove_file(&file_path_mp4).await;
                         let _ = tokio::fs::remove_file(&file_path_hash).await;
+                        let _ = tokio::fs::remove_file(&file_path_receipt).await;
+                        let _ = tokio::fs::remove_file(&file_path_journal).await;
+                        let _ = tokio::fs::remove_file(&file_path_mint_proof).await;
 
                         let db_del = tokio::task::spawn_blocking(move || {
                             let res = db_clone.remove(uuid.as_bytes());
@@ -380,7 +387,6 @@ pub async fn run_backend(
                     });
                 },
                 DaemonCmd::Mint(uuid, target) => {
-                    let key_clone = keystore.clone();
                     let tx_clone = event_tx.clone();
                     let ui_ctx = ctx.clone();
                     let queue = mint_queue.clone();
@@ -392,10 +398,24 @@ pub async fn run_backend(
                         let _ = tx_clone.send(AppEvent::MintProgress(uuid, "QUEUED".to_string()));
                         ui_ctx.request_repaint();
 
-                        let hashes = match resolve_image_hashes(photos_dir_clone, uuid).await {
-                            Ok(h) => h,
+                        let photos_for_gate = photos_dir_clone.clone();
+                        let materials = match tokio::task::spawn_blocking(move || {
+                            require_proof_for_mint(&photos_for_gate, &uuid)
+                        })
+                        .await
+                        {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(e)) => {
+                                let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e));
+                                ui_ctx.request_repaint();
+                                return;
+                            }
                             Err(e) => {
-                                let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e.to_string()));
+                                let _ = tx_clone.send(AppEvent::MintFailed(
+                                    uuid,
+                                    target,
+                                    format!("mint blocked: gate task failed: {e}"),
+                                ));
                                 ui_ctx.request_repaint();
                                 return;
                             }
@@ -403,7 +423,7 @@ pub async fn run_backend(
 
                         // Idempotent short-circuit for a capture that already minted.
                         if let Some(MintOutcome::Completed { tx_hash }) =
-                            queue.peek(&target, &hashes.sha256).await
+                            queue.peek(&target, &materials.meta.sha256).await
                         {
                             println!("[Mint] Duplicate capture, prior tx={tx_hash}");
                             let _ = tx_clone.send(AppEvent::MintSuccess(uuid, target, tx_hash));
@@ -411,14 +431,37 @@ pub async fn run_backend(
                             return;
                         }
 
-                        let device_id = key_clone.public_key_hex();
+                        let meta = materials.meta.clone();
+                        let photos_for_meta = photos_dir_clone.clone();
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            save_mint_proof(&photos_for_meta, &uuid, &meta)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("mint-proof task failed: {e}")))
+                        {
+                            let _ = tx_clone.send(AppEvent::MintFailed(uuid, target, e));
+                            ui_ctx.request_repaint();
+                            return;
+                        }
+
+                        println!(
+                            "[Mint] Proof attached receipt_sha256={} distance={}",
+                            materials.meta.receipt_sha256, materials.meta.distance
+                        );
 
                         let req = MintRequest {
-                            uuid: uuid.to_string(),
-                            sha256: hashes.sha256,
-                            phash: hashes.phash,
-                            device_id,
+                            uuid: materials.record.uuid.clone(),
+                            sha256: materials.meta.sha256.clone(),
+                            phash: materials.meta.phash0.clone(),
+                            device_id: materials.meta.device_pubkey.clone(),
                             target_address: None,
+                            proof: Some(MintProofAttach {
+                                receipt_sha256: materials.meta.receipt_sha256.clone(),
+                                distance: materials.meta.distance,
+                                phash1: materials.meta.phash1.clone(),
+                                receipt_file: materials.meta.receipt_file.clone(),
+                                journal_file: materials.meta.journal_file.clone(),
+                            }),
                         };
 
                         let tx_progress = tx_clone.clone();
