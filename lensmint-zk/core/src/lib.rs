@@ -127,6 +127,94 @@ pub fn verify_authenticity(input: &GuestInput) -> Result<GuestJournal, GuestErro
     })
 }
 
+// On-chain journal: Solidity abi.encode of seven static words (224 bytes).
+// Order: sha256, phash0, phash1, devicePubkey, distance, threshold, alg.
+// phash* and alg are left-aligned in bytes32; uint32 values are right-aligned.
+
+pub const JOURNAL_ABI_LEN: usize = 32 * 7;
+
+fn word_from_bytes(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = data.len().min(32);
+    out[..n].copy_from_slice(&data[..n]);
+    out
+}
+
+fn word_from_u32(v: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[28..32].copy_from_slice(&v.to_be_bytes());
+    out
+}
+
+fn u32_from_word(word: &[u8; 32]) -> u32 {
+    u32::from_be_bytes([word[28], word[29], word[30], word[31]])
+}
+
+pub fn alg_word() -> [u8; 32] {
+    word_from_bytes(HASH_ALG.as_bytes())
+}
+
+impl GuestJournal {
+    pub fn abi_encode(&self) -> Result<Vec<u8>, GuestError> {
+        let sha = decode_fixed::<32>(&self.sha256_hex, "sha256")?;
+        let phash0 = decode_fixed::<8>(&self.phash0_hex, "phash0")?;
+        let phash1 = decode_fixed::<8>(&self.phash1_hex, "phash1")?;
+        let pk = decode_fixed::<32>(&self.device_pubkey_hex, "device_pubkey")?;
+        if self.alg != HASH_ALG {
+            return Err(GuestError::BadHex("alg"));
+        }
+        let mut out = Vec::with_capacity(JOURNAL_ABI_LEN);
+        out.extend_from_slice(&word_from_bytes(&sha));
+        out.extend_from_slice(&word_from_bytes(&phash0));
+        out.extend_from_slice(&word_from_bytes(&phash1));
+        out.extend_from_slice(&word_from_bytes(&pk));
+        out.extend_from_slice(&word_from_u32(self.distance));
+        out.extend_from_slice(&word_from_u32(self.threshold));
+        out.extend_from_slice(&alg_word());
+        Ok(out)
+    }
+
+    pub fn from_abi(bytes: &[u8]) -> Result<Self, GuestError> {
+        if bytes.len() != JOURNAL_ABI_LEN {
+            return Err(GuestError::BadLen {
+                field: "journal_abi",
+                expected: JOURNAL_ABI_LEN,
+                got: bytes.len(),
+            });
+        }
+        let mut words = [[0u8; 32]; 7];
+        for (i, word) in words.iter_mut().enumerate() {
+            word.copy_from_slice(&bytes[i * 32..(i + 1) * 32]);
+        }
+        let mut phash0 = [0u8; 8];
+        let mut phash1 = [0u8; 8];
+        phash0.copy_from_slice(&words[1][..8]);
+        phash1.copy_from_slice(&words[2][..8]);
+        if words[1][8..] != [0u8; 24] || words[2][8..] != [0u8; 24] {
+            return Err(GuestError::BadHex("phash_padding"));
+        }
+        let alg = {
+            let end = words[6]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(words[6].len());
+            std::str::from_utf8(&words[6][..end]).map_err(|_| GuestError::BadHex("alg"))?
+        };
+        if alg != HASH_ALG {
+            return Err(GuestError::BadHex("alg"));
+        }
+        Ok(Self {
+            sha256_hex: hex::encode(words[0]),
+            phash0_hex: hex::encode(phash0),
+            phash1_hex: hex::encode(phash1),
+            device_pubkey_hex: hex::encode(words[3]),
+            distance: u32_from_word(&words[4]),
+            threshold: u32_from_word(&words[5]),
+            alg: alg.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +335,18 @@ mod tests {
             verify_authenticity(&input).unwrap_err(),
             GuestError::BadMessageFormat
         );
+    }
+
+    #[test]
+    fn journal_abi_roundtrip() {
+        let sk = keypair();
+        let sha = "e8e12e6a5f63658efb1766cdec4bd3f56400baf7200f2936710a8027a043676c";
+        let phash0 = "0d1a34489032468c";
+        let msg = canonical_message("751da06f-5c24-41a5-ac57-4733f202940b", sha, phash0);
+        let journal = verify_authenticity(&sign_msg(&sk, &msg)).unwrap();
+        let encoded = journal.abi_encode().unwrap();
+        assert_eq!(encoded.len(), JOURNAL_ABI_LEN);
+        let decoded = GuestJournal::from_abi(&encoded).unwrap();
+        assert_eq!(decoded, journal);
     }
 }

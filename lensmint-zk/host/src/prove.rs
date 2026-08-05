@@ -3,7 +3,7 @@ use crate::phash::sha256_hex;
 use crate::recompress_pick::pick_recompress;
 use lensmint_zk_core::{verify_authenticity, GuestInput, GuestJournal};
 use methods::{AUTHENTICITY_ELF, AUTHENTICITY_ID};
-use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
+use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, Receipt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -11,7 +11,7 @@ use std::time::Instant;
 pub struct ProveRequest {
     pub record: HashRecord,
     pub jpeg_bytes: Vec<u8>,
-    /// Preferred JPEG quality hint; host may scan nearby qualities for a better demo pick.
+    // Preferred JPEG quality; host may scan nearby values for a demo pick.
     pub recompress_quality: u8,
     pub out_dir: PathBuf,
 }
@@ -66,13 +66,24 @@ pub fn prove_and_save(req: &ProveRequest) -> anyhow::Result<BenchStats> {
     let env = ExecutorEnv::builder().write(&input)?.build()?;
     let prover = default_prover();
 
+    // Groth16 for Sepolia; RISC0_DEV_MODE keeps the fast fake path.
+    let use_dev = matches!(
+        std::env::var("RISC0_DEV_MODE").ok().as_deref(),
+        Some(v) if v != "0" && !v.is_empty()
+    );
     let started = Instant::now();
-    let prove_info = prover.prove(env, AUTHENTICITY_ELF)?;
+    let prove_info = if use_dev {
+        prover.prove(env, AUTHENTICITY_ELF)?
+    } else {
+        prover.prove_with_opts(env, AUTHENTICITY_ELF, &ProverOpts::groth16())?
+    };
     let prove_wall_ms = started.elapsed().as_millis();
 
     let receipt = prove_info.receipt;
     receipt.verify(AUTHENTICITY_ID)?;
-    let journal: GuestJournal = receipt.journal.decode()?;
+    // Guest journal is Solidity abi.encode bytes.
+    let journal = GuestJournal::from_abi(receipt.journal.as_ref())
+        .map_err(|e| anyhow::anyhow!("decode ABI journal: {e}"))?;
 
     let receipt_path = req.out_dir.join(format!("{}.receipt.bin", req.record.uuid));
     save_receipt(&receipt_path, &receipt)?;
@@ -80,6 +91,13 @@ pub fn prove_and_save(req: &ProveRequest) -> anyhow::Result<BenchStats> {
 
     let journal_path = req.out_dir.join(format!("{}.journal.json", req.record.uuid));
     std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal)?)?;
+    let journal_abi_path = req.out_dir.join(format!("{}.journal.abi", req.record.uuid));
+    std::fs::write(
+        &journal_abi_path,
+        journal
+            .abi_encode()
+            .map_err(|e| anyhow::anyhow!("encode ABI journal: {e}"))?,
+    )?;
 
     Ok(BenchStats {
         prove_wall_ms,
@@ -104,6 +122,27 @@ pub fn save_receipt(path: &Path, receipt: &Receipt) -> anyhow::Result<()> {
 pub fn load_receipt(path: &Path) -> anyhow::Result<Receipt> {
     let bytes = std::fs::read(path)?;
     Ok(bincode::deserialize(&bytes)?)
+}
+
+// On-chain seal: 4-byte verifier selector then Groth16 seal bytes.
+pub fn groth16_seal(receipt: &Receipt) -> anyhow::Result<Vec<u8>> {
+    let groth16 = receipt
+        .inner
+        .groth16()
+        .map_err(|e| anyhow::anyhow!("receipt is not Groth16 (need non-dev prove with groth16): {e}"))?;
+    let selector = &groth16.verifier_parameters.as_bytes()[..4];
+    let mut out = Vec::with_capacity(4 + groth16.seal.len());
+    out.extend_from_slice(selector);
+    out.extend_from_slice(&groth16.seal);
+    Ok(out)
+}
+
+pub fn authenticity_image_id_hex() -> String {
+    let mut bytes = [0u8; 32];
+    for (i, word) in AUTHENTICITY_ID.iter().enumerate() {
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    }
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
