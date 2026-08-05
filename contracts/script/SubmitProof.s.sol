@@ -2,30 +2,21 @@
 pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
-import {LensMintVerifier} from "../src/LensMintVerifier.sol";
+import {AuthenticityVerifier} from "../src/AuthenticityVerifier.sol";
 
 contract SubmitProofScript is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
-        address deployer = vm.addr(deployerPrivateKey);
-        
-        address verifierAddress = vm.envAddress("VERIFIER_CONTRACT_ADDRESS");
-        string memory proofFilePath = vm.envString("PROOF_FILE");
-        
-        console.log("=== Submitting ZK Proof ===");
-        console.log("Deployer:", deployer);
-        console.log("Verifier Contract:", verifierAddress);
-        console.log("Proof File:", proofFilePath);
-        
-        string memory proofJson = vm.readFile(proofFilePath);
-        
+        address authAddr = vm.envAddress("AUTHENTICITY_VERIFIER_ADDRESS");
+        string memory sealPath = vm.envString("SEAL_FILE");
+        string memory journalPath = vm.envString("JOURNAL_ABI_FILE");
+
+        bytes memory seal = vm.readFileBinary(sealPath);
+        bytes memory journal = vm.readFileBinary(journalPath);
+
         vm.startBroadcast(deployerPrivateKey);
-        
-        LensMintVerifier verifier = LensMintVerifier(verifierAddress);
-        
+        AuthenticityVerifier(authAddr).verifyAuthenticity(seal, journal);
         vm.stopBroadcast();
-        
-        console.log("Proof submission complete");
+        console.log("submit complete");
     }
 }
-
