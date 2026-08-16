@@ -150,6 +150,14 @@ pub async fn mint(
     println!("  - contract:  {}", chain_cfg.lensmint);
     println!("  - recipient: {recipient}");
     println!("  - deviceId:  {device_id}");
+    if let Some(proof) = &req.proof {
+        println!(
+            "  - proof:     receipt_sha256={} file={} distance={}",
+            proof.receipt_sha256, proof.receipt_file, proof.distance
+        );
+    } else {
+        return Err("EVM mint requires proof attachment from mint gate".into());
+    }
 
     let fee_cap = gwei(MAX_GAS_FEE_CAP_GWEI);
     let mut sent_hashes: Vec<B256> = Vec::new();

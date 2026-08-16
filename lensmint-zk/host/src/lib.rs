@@ -9,5 +9,7 @@ mod recompress_pick;
 pub use fixture::make_signed_fixture;
 pub use hash_record::HashRecord;
 pub use phash::{gradient_phash_hex, recompress_jpeg, sha256_hex};
-pub use prove::{load_receipt, prove_and_save, BenchStats, ProveRequest};
+pub use prove::{
+    authenticity_image_id_hex, groth16_seal, load_receipt, prove_and_save, BenchStats, ProveRequest,
+};
 pub use recompress_pick::{pick_recompress, RecompressPick};
