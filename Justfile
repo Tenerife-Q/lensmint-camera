@@ -1,7 +1,7 @@
 TARGET := "aarch64-unknown-linux-gnu"
 PI_USER := "tenerife"
-PI_IP := "192.168.210.101"
-HOST_IP := "192.168.210.182" 
+PI_IP := "192.168.108.101"
+HOST_IP := "192.168.108.182" 
 APP_DIR := "rust-camera-daemon/lensmint-daemon"
 
 # 强制 Cargo 使用 AArch64 链接器
