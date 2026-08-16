@@ -11,7 +11,7 @@ contract DeployScript is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        LensMint lensMint = new LensMint(deployerAddress, deployerAddress);
+        LensMint lensMint = new LensMint();
 
         vm.stopBroadcast();
 

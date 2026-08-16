@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::path::PathBuf;
 use std::collections::HashMap;
-use crate::cmd::{DaemonCmd, AppEvent, ChainTarget};
+use crate::cmd::{DaemonCmd, AppEvent, ChainTarget, CameraSettings};
 
 #[derive(PartialEq, Clone)]
 enum AppMode {
@@ -15,15 +15,9 @@ enum AppMode {
 
 #[derive(Clone, PartialEq)]
 enum MintStatus {
-    Minting,
+    Processing(String), // Track fine-grained progress
     Success,
-    Failed,
-}
-
-#[derive(PartialEq, Clone)]
-enum SelectedChain {
-    EVM,
-    Solana,
+    Failed(String),
 }
 
 #[derive(PartialEq, Clone)]
@@ -48,8 +42,7 @@ pub struct LensMintApp {
     capture_mode: CaptureMode,
     is_recording: bool,
     mint_states: HashMap<uuid::Uuid, MintStatus>,
-    default_chain: SelectedChain,
-    master_wallet: String,
+    settings: CameraSettings, 
 }
 
 impl LensMintApp {
@@ -62,7 +55,15 @@ impl LensMintApp {
         photos_dir: PathBuf,
     ) -> Self {
         let local_focus = shared_focus.load(Ordering::Relaxed);
-        Self { 
+        
+        // Load persistent settings
+        let settings = if let Ok(Some(bytes)) = db.get(b"camera_settings") {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| LensMintApp::default_settings())
+        } else {
+            LensMintApp::default_settings()
+        };
+
+        let mut app = Self { 
             tx, event_rx, shared_frame, shared_focus, local_focus, db, photos_dir,
             zoom_level: 1.0, 
             texture: None,
@@ -72,8 +73,22 @@ impl LensMintApp {
             capture_mode: CaptureMode::Photo,
             is_recording: false,
             mint_states: HashMap::new(),
-            default_chain: SelectedChain::EVM,
-            master_wallet: "0xLensMint...Camera".to_string(),
+            settings,
+        };
+        
+        let _ = app.tx.try_send(DaemonCmd::UpdateSettings(app.settings.clone()));
+        app
+    }
+
+    fn default_settings() -> CameraSettings {
+        CameraSettings::default()
+    }
+
+    fn save_settings(&self) {
+        if let Ok(json) = serde_json::to_vec(&self.settings) {
+            let _ = self.db.insert(b"camera_settings", json);
+            let _ = self.db.flush();
+            let _ = self.tx.try_send(DaemonCmd::UpdateSettings(self.settings.clone()));
         }
     }
 
@@ -245,7 +260,7 @@ impl LensMintApp {
                         let shutter_size = egui::vec2(72.0, 72.0);
                         let (rect, response) = ui.allocate_exact_size(shutter_size, egui::Sense::click());
                         let center = rect.center();
-                        ui.painter().circle_stroke(center, 34.0, egui::Stroke::new(3.0, egui::Color32::WHITE));
+                        ui.painter().circle_stroke(center, 34.0, egui::Stroke::new(3.0_f32, egui::Color32::WHITE));
                         
                         let inner_radius = if response.is_pointer_button_down_on() { 26.0 } else { 30.0 };
                         let inner_color = if self.capture_mode == CaptureMode::Video {
@@ -393,12 +408,13 @@ impl LensMintApp {
                         self.mode = AppMode::Gallery;
                     }
                     
+                    // Render queue progress
                     if let Some(status) = self.mint_states.get(&target_uuid) {
                         ui.add_space(10.0);
                         let (text, color) = match status {
-                            MintStatus::Minting => ("MINTING...", egui::Color32::YELLOW),
-                            MintStatus::Success => ("ON-CHAIN", egui::Color32::from_rgb(46, 204, 113)),
-                            MintStatus::Failed => ("FAILED", egui::Color32::RED),
+                            MintStatus::Processing(state) => (state.to_uppercase(), egui::Color32::YELLOW),
+                            MintStatus::Success => ("ON-CHAIN".to_string(), egui::Color32::from_rgb(46, 204, 113)),
+                            MintStatus::Failed(err) => (format!("FAILED: {}", err), egui::Color32::RED),
                         };
                         egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).rounding(16.0).inner_margin(egui::Margin::symmetric(12.0, 6.0)).show(ui, |ui| {
                             ui.label(egui::RichText::new(text).color(color).strong().size(12.0));
@@ -417,9 +433,8 @@ impl LensMintApp {
                             .min_size(egui::vec2(80.0, 32.0));
                             
                         if ui.add(btn_mint).clicked() {
-                            self.mint_states.insert(target_uuid, MintStatus::Minting);
-                            let target = if self.default_chain == SelectedChain::EVM { ChainTarget::EVM } else { ChainTarget::Solana };
-                            let _ = self.tx.try_send(DaemonCmd::Mint(target_uuid, target));
+                            self.mint_states.insert(target_uuid, MintStatus::Processing("QUEUED".to_string()));
+                            let _ = self.tx.try_send(DaemonCmd::Mint(target_uuid, self.settings.active_chain.clone()));
                         }
 
                         ui.add(egui::Separator::default().vertical());
@@ -481,19 +496,49 @@ impl LensMintApp {
                     ui.label(egui::RichText::new("Blockchain Settings").color(egui::Color32::WHITE).size(18.0).strong());
                     ui.add_space(10.0);
                     egui::Frame::none().fill(egui::Color32::from_rgb(30, 30, 32)).rounding(8.0).inner_margin(12.0).show(ui, |ui| {
+                        let mut changed = false;
+
                         ui.label(egui::RichText::new("DEFAULT MINTING CHAIN").color(egui::Color32::from_gray(150)).size(11.0));
                         ui.add_space(4.0);
-                        egui::ComboBox::from_id_salt("chain_combo")
-                            .selected_text(if self.default_chain == SelectedChain::EVM { "Ethereum (EVM)" } else { "Solana" })
+                        changed |= egui::ComboBox::from_id_salt("chain_combo")
+                            .selected_text(if self.settings.active_chain == ChainTarget::EVM { "Ethereum (EVM)" } else { "Solana" })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.default_chain, SelectedChain::EVM, "Ethereum (EVM)");
-                                ui.selectable_value(&mut self.default_chain, SelectedChain::Solana, "Solana");
-                            });
+                                let c1 = ui.selectable_value(&mut self.settings.active_chain, ChainTarget::EVM, "Ethereum (EVM)").changed();
+                                let c2 = ui.selectable_value(&mut self.settings.active_chain, ChainTarget::Solana, "Solana").changed();
+                                c1 || c2
+                            }).inner.unwrap_or(false);
 
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new("MASTER WALLET").color(egui::Color32::from_gray(150)).size(11.0));
-                        ui.add_space(4.0);
-                        ui.add(egui::TextEdit::singleline(&mut self.master_wallet).margin(egui::vec2(10.0, 10.0)));
+                        if self.settings.active_chain == ChainTarget::EVM {
+                            ui.label(egui::RichText::new("EVM CHAIN ID").color(egui::Color32::from_gray(150)).size(11.0));
+                            ui.add_space(4.0);
+                            let mut chain_id_text = self.settings.evm_chain_id.to_string();
+                            if ui.add(egui::TextEdit::singleline(&mut chain_id_text).margin(egui::vec2(10.0, 10.0))).changed() {
+                                if let Ok(id) = chain_id_text.trim().parse::<u64>() {
+                                    self.settings.evm_chain_id = id;
+                                    changed = true;
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("RPCs loaded at runtime from chainlist.org").color(egui::Color32::from_gray(120)).size(11.0));
+                        } else {
+                            ui.label(egui::RichText::new("SOLANA CLUSTER").color(egui::Color32::from_gray(150)).size(11.0));
+                            ui.add_space(4.0);
+                            changed |= egui::ComboBox::from_id_salt("solana_cluster_combo")
+                                .selected_text(&self.settings.solana_cluster)
+                                .show_ui(ui, |ui| {
+                                    let c1 = ui.selectable_value(&mut self.settings.solana_cluster, "devnet".into(), "devnet").changed();
+                                    let c2 = ui.selectable_value(&mut self.settings.solana_cluster, "testnet".into(), "testnet").changed();
+                                    let c3 = ui.selectable_value(&mut self.settings.solana_cluster, "mainnet".into(), "mainnet").changed();
+                                    c1 || c2 || c3
+                                }).inner.unwrap_or(false);
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("RPCs from config/solana_rpcs.json").color(egui::Color32::from_gray(120)).size(11.0));
+                        }
+
+                        if changed {
+                            self.save_settings();
+                        }
                     });
                 });
             });
@@ -503,15 +548,19 @@ impl LensMintApp {
 
 impl eframe::App for LensMintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle background async daemon events
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                AppEvent::MintProgress(uuid, state) => {
+                    self.mint_states.insert(uuid, MintStatus::Processing(state));
+                },
                 AppEvent::MintSuccess(uuid, target, tx_hash) => {
                     println!("[UI] Minted successfully on {:?}, tx_hash: {}", target, tx_hash);
                     self.mint_states.insert(uuid, MintStatus::Success);
                 },
                 AppEvent::MintFailed(uuid, target, err_msg) => {
                     eprintln!("[UI] Mint failed on {:?}: {}", target, err_msg);
-                    self.mint_states.insert(uuid, MintStatus::Failed);
+                    self.mint_states.insert(uuid, MintStatus::Failed(err_msg));
                 }
             }
         }

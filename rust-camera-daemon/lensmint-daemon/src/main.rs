@@ -2,6 +2,9 @@ mod keystore;
 mod app;
 mod backend;
 mod cmd;
+mod config;
+mod chain;
+mod queue;
 
 use app::LensMintApp;
 use cmd::{DaemonCmd, AppEvent};

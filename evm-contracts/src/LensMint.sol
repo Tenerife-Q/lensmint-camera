@@ -1,58 +1,52 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.20;
 
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract LensMint is ERC721, AccessControl {
-    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
-
+contract LensMint is ERC721, Ownable {
     uint256 private _nextTokenId;
 
-    struct CameraRecord {
-        string uuid;
-        bytes32 sha256Hash;
-        string pHash;
-        uint256 timestamp;
-    }
-
-    mapping(uint256 => CameraRecord) public cameraRecords;
+    // Track authorized cameras
+    mapping(string => bool) public registeredDevices;
+    // Prevent image hash replay
     mapping(bytes32 => bool) public mintedHashes;
 
-    event PhotoMinted(uint256 indexed tokenId, address indexed owner, string uuid, bytes32 sha256Hash);
+    event DeviceRegistered(string indexed deviceId);
+    event HardwareMinted(uint256 indexed tokenId, string uuid, bytes32 indexed sha256Hash);
 
-    constructor(address defaultAdmin, address initialRelayer) ERC721("LensMint Camera", "LENS") {
-        _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
-        _grantRole(RELAYER_ROLE, initialRelayer);
+    constructor() ERC721("LensMint Physical NFT", "LMP") Ownable(msg.sender) {}
+
+    // Add device to whitelist
+    function registerDevice(string calldata deviceId) external onlyOwner {
+        registeredDevices[deviceId] = true;
+        emit DeviceRegistered(deviceId);
     }
 
+    // Direct hardware minting verify execution
     function mintFromHardware(
         address to,
         string calldata uuid,
         bytes32 sha256Hash,
-        string calldata pHash
-    ) external onlyRole(RELAYER_ROLE) returns (uint256) {
-        require(!mintedHashes[sha256Hash], "LensMint: Hash already minted");
-        require(to != address(0), "LensMint: Zero address");
+        string calldata phash,
+        string calldata deviceId
+    ) external returns (uint256) {
+        // Assertions
+        require(registeredDevices[deviceId], "Unauthorized device");
+        require(!mintedHashes[sha256Hash], "Duplicate asset hash");
 
         uint256 tokenId = _nextTokenId++;
-        
         mintedHashes[sha256Hash] = true;
-        cameraRecords[tokenId] = CameraRecord({
-            uuid: uuid,
-            sha256Hash: sha256Hash,
-            pHash: pHash,
-            timestamp: block.timestamp
-        });
 
         _safeMint(to, tokenId);
 
-        emit PhotoMinted(tokenId, to, uuid, sha256Hash);
+        // Metadata parameters binding placeholder
+        string memory _uuid = uuid;
+        string memory _phash = phash;
+        bytes32 _hash = sha256Hash;
         
-        return tokenId;
-    }
+        emit HardwareMinted(tokenId, _uuid, _hash);
 
-    function supportsInterface(bytes4 interfaceId) public view override(ERC721, AccessControl) returns (bool) {
-        return super.supportsInterface(interfaceId);
+        return tokenId;
     }
 }

@@ -94,6 +94,12 @@ deployment.json
 .device_key_export
 .temp_get_key.py
 
+# Solana keypairs / program buffers (contain private keys)
+*-keypair.json
+buffer*.json
+my-buffer.json
+**/id.json
+
 # Captures / uploads
 captures/
 uploads/
@@ -122,6 +128,19 @@ coverage/
 # Rust (for risc0)
 target/
 Cargo.lock
+
+# Internal handoff / report drafts (not for version control)
+docs/issue-17-edge-cases.md
+docs/pr-handoff-issue-17-single-daemon.md
+
+# Legacy Node/TS relayer — superseded by in-daemon Rust adapters.
+# Keep a local copy if needed; do not publish further changes in new PRs.
+# (Historically tracked files remain in git history until removed in a cleanup PR.)
+relayer-backend/src/adapters/
+relayer-backend/src/worker.ts
+relayer-backend/src/queue.ts
+relayer-backend/src/evmProvider.ts
+relayer-backend/src/register_*.ts
 
 # Misc
 *.bak
