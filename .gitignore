@@ -132,6 +132,24 @@ Cargo.lock
 # Internal handoff / report drafts (not for version control)
 docs/issue-17-edge-cases.md
 docs/pr-handoff-issue-17-single-daemon.md
+docs/pr-body-issue-17.md
+docs/pr-evidence-issue-17/
+docs/pr-handoff-phase2-hashing-zk.md
+docs/phase2-plan-hashing-zk.md
+docs/phase2-execution-plan-4w.md
+docs/phase2-notion-weekly-milestones.md
+docs/phase2-meeting-talk-track.md
+docs/phase2-mentor-touch-en.md
+docs/gsoc-final-phase-playbook.md
+docs/phase2-issues-draft.md
+docs/ TechnologyReflection.md
+docs/GSoC2026TenerifeLensMintProposal.pdf
+docs/issue-18-architecture-learn.md
+docs/pr-body-issue-18.md
+
+# Local leftovers — do not push
+solana-contracts/programs/solana-contracts/tests_bak/
+evm-contracts/broadcast/**/run-*.json
 
 # Legacy Node/TS relayer — superseded by in-daemon Rust adapters.
 # Keep a local copy if needed; do not publish further changes in new PRs.
