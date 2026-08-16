@@ -64,7 +64,9 @@ impl LensMintApp {
                     .flatten()
                     .filter_map(|entry| {
                         let path = entry.path();
-                        if path.extension().and_then(|e| e.to_str()) != Some("jpg") { return None; }
+                        // both jpg and mp4
+                        let ext = path.extension().and_then(|e| e.to_str())?;
+                        if ext != "jpg" && ext != "mp4" { return None; }
                         let modified_time = entry.metadata().ok()?.modified().ok()?;
                         Some((path, modified_time))
                     })
@@ -80,17 +82,23 @@ impl LensMintApp {
                             let img_bytes = match db.get(uuid.as_bytes()) {
                                 Ok(Some(bytes)) => bytes.to_vec(),
                                 _ => {
-                                    if let Ok(raw) = image::open(&path) {
-                                        // Fast 4:3 downsample via Triangle filter
-                                        let thumb = image::imageops::resize(&raw, 256, 192, image::imageops::FilterType::Triangle);
-                                        let mut buf = std::io::Cursor::new(Vec::new());
-                                        if thumb.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
-                                            let bytes = buf.into_inner();
-                                            let _ = db.insert(uuid.as_bytes(), bytes.clone());
-                                            let _ = db.flush();
-                                            bytes
+                                    // Skip image decoder for mp4 if cache missed
+                                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                    if ext == "jpg" {
+                                        if let Ok(raw) = image::open(&path) {
+                                            // Fast 4:3 downsample via Triangle filter
+                                            let thumb = image::imageops::resize(&raw, 256, 192, image::imageops::FilterType::Triangle);
+                                            let mut buf = std::io::Cursor::new(Vec::new());
+                                            if thumb.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
+                                                let bytes = buf.into_inner();
+                                                let _ = db.insert(uuid.as_bytes(), bytes.clone());
+                                                let _ = db.flush();
+                                                bytes
+                                            } else { continue; }
                                         } else { continue; }
-                                    } else { continue; }
+                                    } else {
+                                        continue;
+                                    }
                                 }
                             };
 
@@ -111,6 +119,13 @@ impl LensMintApp {
     }
 
     fn render_camera(&mut self, ctx: &egui::Context) {
+        // [NEW] Capture multi-touch pinch-to-zoom gesture
+        let zoom_delta = ctx.input(|i| i.zoom_delta());
+        if zoom_delta != 1.0 {
+            // Multiply the delta and clamp strictly between 1.0x and 3.0x
+            self.zoom_level = (self.zoom_level * zoom_delta).clamp(1.0, 3.0);
+        }
+
         let frame = egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(0.0);
         
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -201,9 +216,16 @@ impl LensMintApp {
                         .fill(video_color)
                         .min_size(egui::vec2(block_w, block_h))
                         .rounding(0.0);
+                        
                     if ui.add(btn_video).clicked() {
+                        if self.is_recording {
+                            let _ = self.tx.try_send(DaemonCmd::StopVideo);
+                        } else {
+                            let _ = self.tx.try_send(DaemonCmd::StartVideo(uuid::Uuid::new_v4()));
+                        }
                         self.is_recording = !self.is_recording;
                     }
+
 
                     // 3. ZOOM
                     ui.vertical(|ui| {
