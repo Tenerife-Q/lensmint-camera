@@ -1,9 +1,119 @@
-// Stub only. Real prove and receipt live in a later issue.
+use anyhow::Context;
+use host::{make_signed_fixture, pick_recompress, prove_and_save, HashRecord, ProveRequest};
+use std::env;
+use std::path::PathBuf;
 
-use methods::{AUTHENTICITY_ELF, AUTHENTICITY_ID};
+fn main() -> anyhow::Result<()> {
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        print_usage();
+        std::process::exit(2);
+    }
+    let cmd = args.remove(0);
+    match cmd.as_str() {
+        "bench" => cmd_bench(&args),
+        "prove" => cmd_prove(&args),
+        "probe" => cmd_probe(&args),
+        "help" | "-h" | "--help" => {
+            print_usage();
+            Ok(())
+        }
+        other => anyhow::bail!("unknown command: {other}"),
+    }
+}
 
-fn main() {
-    println!("AUTHENTICITY_ID={AUTHENTICITY_ID:?}");
-    println!("guest ELF {} bytes", AUTHENTICITY_ELF.len());
-    println!("statement tests: cargo test -p lensmint-zk-core");
+fn print_usage() {
+    eprintln!(
+        "Usage:
+  host probe [--quality N]          # no prove: scan recompress / pHash only
+  host bench [--out DIR] [--quality N]
+  host prove --record FILE.hash.json --jpeg FILE.jpg [--out DIR] [--quality N]
+
+bench builds a local fixture, picks a recompress demo, proves, writes receipt.
+Set RISC0_DEV_MODE=1 for a fast fake receipt (tests only). Omit it for real prove numbers."
+    );
+}
+
+fn cmd_probe(args: &[String]) -> anyhow::Result<()> {
+    let preferred = flag_value(args, "--quality")
+        .map(|s| s.parse::<u8>())
+        .transpose()?;
+    let (record, jpeg) = make_signed_fixture()?;
+    let pick = pick_recompress(&jpeg, &record.phash, preferred)?;
+    println!("sha256_original={}", record.sha256);
+    println!("sha256_recompressed={}", pick.sha256_recompressed);
+    println!("sha256_changed={}", record.sha256 != pick.sha256_recompressed);
+    println!("phash0={}", record.phash);
+    println!("phash1={}", pick.phash1_hex);
+    println!("distance={}", pick.distance);
+    println!("quality={}", pick.quality);
+    println!("threshold=5");
+    Ok(())
+}
+
+fn cmd_bench(args: &[String]) -> anyhow::Result<()> {
+    let out = flag_value(args, "--out").unwrap_or_else(|| "out".into());
+    let quality = flag_value(args, "--quality")
+        .map(|s| s.parse::<u8>())
+        .transpose()?
+        .unwrap_or(50);
+
+    let out_dir = PathBuf::from(out);
+    std::fs::create_dir_all(&out_dir)?;
+
+    let (record, jpeg) = make_signed_fixture()?;
+    record.save_path(&out_dir.join(format!("{}.hash.json", record.uuid)))?;
+    std::fs::write(out_dir.join(format!("{}.jpg", record.uuid)), &jpeg)?;
+
+    run_prove(record, jpeg, quality, out_dir)
+}
+
+fn cmd_prove(args: &[String]) -> anyhow::Result<()> {
+    let record_path = flag_value(args, "--record").context("missing --record")?;
+    let jpeg_path = flag_value(args, "--jpeg").context("missing --jpeg")?;
+    let out = flag_value(args, "--out").unwrap_or_else(|| "out".into());
+    let quality = flag_value(args, "--quality")
+        .map(|s| s.parse::<u8>())
+        .transpose()?
+        .unwrap_or(50);
+
+    let record = HashRecord::load_path(PathBuf::from(record_path).as_path())?;
+    let jpeg = std::fs::read(jpeg_path)?;
+    run_prove(record, jpeg, quality, PathBuf::from(out))
+}
+
+fn run_prove(
+    record: HashRecord,
+    jpeg: Vec<u8>,
+    quality: u8,
+    out_dir: PathBuf,
+) -> anyhow::Result<()> {
+    let stats = prove_and_save(&ProveRequest {
+        record,
+        jpeg_bytes: jpeg,
+        recompress_quality: quality,
+        out_dir,
+    })?;
+
+    println!("prove_wall_ms={}", stats.prove_wall_ms);
+    println!("receipt_bytes={}", stats.receipt_bytes);
+    println!("receipt_path={}", stats.receipt_path.display());
+    println!("recompress_quality={}", stats.recompress_quality);
+    println!("distance={}", stats.distance);
+    println!("phash0={}", stats.phash0_hex);
+    println!("phash1={}", stats.phash1_hex);
+    println!("threshold={}", stats.journal.threshold);
+    println!("sha256_original={}", stats.sha256_original);
+    println!("sha256_recompressed={}", stats.sha256_recompressed);
+    println!(
+        "sha256_changed={}",
+        stats.sha256_original != stats.sha256_recompressed
+    );
+    Ok(())
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|w| w[0] == name)
+        .map(|w| w[1].clone())
 }
