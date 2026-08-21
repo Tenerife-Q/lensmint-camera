@@ -77,3 +77,7 @@ pub fn load_solana_rpcs() -> SolanaRpcConfig {
     let raw = read_config("solana_rpcs.json", EMBEDDED_SOLANA_RPCS);
     serde_json::from_str(&raw).expect("Invalid solana_rpcs.json")
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod config_tests;
