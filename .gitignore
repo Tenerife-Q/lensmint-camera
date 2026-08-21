@@ -117,6 +117,14 @@ uploads/
 !assets/**/*.gif
 !assets/**/*.webp
 
+# Public GSoC documentation images
+!docs/gsoc-2026/*.jpg
+!docs/gsoc-2026/**/*.jpg
+!docs/gsoc-2026/*.jpeg
+!docs/gsoc-2026/**/*.jpeg
+!docs/gsoc-2026/*.png
+!docs/gsoc-2026/**/*.png
+
 # Coverage reports
 coverage/
 .nyc_output/
@@ -130,7 +138,7 @@ target/
 Cargo.lock
 
 # Internal handoff / report drafts (not for version control)
-docs/
+local-docs/
 # Local leftovers — do not push
 solana-contracts/programs/solana-contracts/tests_bak/
 evm-contracts/broadcast/**/run-*.json
