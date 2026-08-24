@@ -275,3 +275,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "proof_gate_gap_tests.rs"]
+mod proof_gate_gap_tests;
