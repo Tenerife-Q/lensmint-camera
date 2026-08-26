@@ -1,0 +1,19 @@
+skip_local_validator = true
+
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+solana_contracts = "Cco1bP778KAZNR5uLCRgmt3iFQ3cjGudyiMcnTJ7X1nW"
+
+[provider]
+cluster = "https://solana-devnet.g.alchemy.com/v2/QUCD9VHFbTP6WCJeZ3SNq"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test"
+
+[hooks]

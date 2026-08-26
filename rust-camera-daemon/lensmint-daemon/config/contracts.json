@@ -1,0 +1,14 @@
+{
+  "evm": {
+    "11155111": {
+      "name": "Sepolia",
+      "lensmint": "0x263E52714bb8A80C98d08A7fC541e9Ae1d6C96cC"
+    }
+  },
+  "solana": {
+    "devnet": {
+      "program_id": "Cco1bP778KAZNR5uLCRgmt3iFQ3cjGudyiMcnTJ7X1nW",
+      "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+    }
+  }
+}

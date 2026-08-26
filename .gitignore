@@ -94,6 +94,12 @@ deployment.json
 .device_key_export
 .temp_get_key.py
 
+# Solana keypairs / program buffers (contain private keys)
+*-keypair.json
+buffer*.json
+my-buffer.json
+**/id.json
+
 # Captures / uploads
 captures/
 uploads/
@@ -111,6 +117,14 @@ uploads/
 !assets/**/*.gif
 !assets/**/*.webp
 
+# Public GSoC documentation images
+!docs/gsoc-2026/*.jpg
+!docs/gsoc-2026/**/*.jpg
+!docs/gsoc-2026/*.jpeg
+!docs/gsoc-2026/**/*.jpeg
+!docs/gsoc-2026/*.png
+!docs/gsoc-2026/**/*.png
+
 # Coverage reports
 coverage/
 .nyc_output/
@@ -122,6 +136,21 @@ coverage/
 # Rust (for risc0)
 target/
 Cargo.lock
+
+# Internal handoff / report drafts (not for version control)
+local-docs/
+# Local leftovers — do not push
+solana-contracts/programs/solana-contracts/tests_bak/
+evm-contracts/broadcast/**/run-*.json
+
+# Legacy Node/TS relayer — superseded by in-daemon Rust adapters.
+# Keep a local copy if needed; do not publish further changes in new PRs.
+# (Historically tracked files remain in git history until removed in a cleanup PR.)
+relayer-backend/src/adapters/
+relayer-backend/src/worker.ts
+relayer-backend/src/queue.ts
+relayer-backend/src/evmProvider.ts
+relayer-backend/src/register_*.ts
 
 # Misc
 *.bak
